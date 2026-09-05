@@ -538,7 +538,7 @@ async function createCreatorStripeUrl(discordUserId) {
     );
 
   const partnerLinksBaseUrl =
-    'https:' + '//partnerlinks.app';
+    'https:' + '//referrals.partnerlinks.app';
 
   return {
     url:
