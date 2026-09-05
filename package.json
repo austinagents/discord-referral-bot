@@ -1,0 +1,28 @@
+{
+  "name": "discord-referral-bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node index.js",
+    "check": "node --check index.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/austinagents/discord-referral-bot.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/austinagents/discord-referral-bot/issues"
+  },
+  "homepage": "https://github.com/austinagents/discord-referral-bot#readme",
+  "dependencies": {
+    "better-sqlite3": "^13.0.1",
+    "discord.js": "^14.27.0",
+    "dotenv": "^17.4.2"
+  }
+}
