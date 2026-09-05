@@ -537,34 +537,17 @@ async function createCreatorStripeUrl(discordUserId) {
       discordUserId,
     );
 
-  if (
-    account.details_submitted &&
-    account.payouts_enabled
-  ) {
-    const loginLink =
-      await stripe.accounts.createLoginLink(
-        account.id,
-      );
-
-    return {
-      url: loginLink.url,
-      connected: true,
-    };
-  }
-
-  const accountLink =
-    await stripe.accountLinks.create({
-      account: account.id,
-      refresh_url:
-  'https://partnerlinks.app/stripe/connect/refresh',
-return_url:
-  'https://partnerlinks.app/stripe/connect/return',
-      type: 'account_onboarding',
-    });
+  const partnerLinksBaseUrl =
+    'https:' + '//partnerlinks.app';
 
   return {
-    url: accountLink.url,
-    connected: false,
+    url:
+      partnerLinksBaseUrl +
+      '/stripe/connect/start?account=' +
+      encodeURIComponent(account.id),
+    connected:
+      account.details_submitted &&
+      account.payouts_enabled,
   };
 }
 
