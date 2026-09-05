@@ -5,6 +5,7 @@ require('dotenv').config();
 const fs = require('node:fs');
 const path = require('node:path');
 const Database = require('better-sqlite3');
+const Stripe = require('stripe');
 
 const {
   ActionRowBuilder,
@@ -32,6 +33,7 @@ const requiredEnvironmentVariables = [
   'GUILD_ID',
   'REFERRAL_PANEL_CHANNEL_ID',
   'REFERRAL_ENTRY_CHANNEL_ID',
+  'STRIPE_SECRET_KEY',
 ];
 
 for (const variableName of requiredEnvironmentVariables) {
@@ -67,6 +69,8 @@ const config = {
 
   entryChannelId:
     process.env.REFERRAL_ENTRY_CHANNEL_ID.trim(),
+  stripeSecretKey:
+    process.env.STRIPE_SECRET_KEY.trim(),
 
   verifiedRoleId:
     process.env.REFERRAL_VERIFIED_ROLE_ID?.trim() || null,
@@ -86,6 +90,8 @@ const config = {
     10,
   ),
 };
+
+const stripe = new Stripe(config.stripeSecretKey);
 
 /*
 |--------------------------------------------------------------------------
@@ -391,6 +397,40 @@ const statements = {
 
     LIMIT ?
   `),
+  getStripeAccountForUser: database.prepare(`
+    SELECT
+      discord_user_id,
+      stripe_account_id,
+      onboarding_status,
+      charges_enabled,
+      payouts_enabled,
+      created_at,
+      updated_at
+    FROM creator_stripe_accounts
+    WHERE discord_user_id = ?
+    LIMIT 1
+  `),
+
+  saveStripeAccountForUser: database.prepare(`
+    INSERT INTO creator_stripe_accounts (
+      discord_user_id,
+      stripe_account_id,
+      onboarding_status,
+      charges_enabled,
+      payouts_enabled,
+      created_at,
+      updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(discord_user_id)
+    DO UPDATE SET
+      stripe_account_id = excluded.stripe_account_id,
+      onboarding_status = excluded.onboarding_status,
+      charges_enabled = excluded.charges_enabled,
+      payouts_enabled = excluded.payouts_enabled,
+      updated_at = excluded.updated_at
+  `),
+
 };
 
 /*
@@ -437,6 +477,99 @@ function getUserStatistics(guildId, userId) {
 
 /*
 |--------------------------------------------------------------------------
+| Stripe Connect
+|--------------------------------------------------------------------------
+*/
+
+function saveStripeAccount(discordUserId, account) {
+  const timestamp = nowIso();
+
+  statements.saveStripeAccountForUser.run(
+    discordUserId,
+    account.id,
+    account.details_submitted ? 'complete' : 'pending',
+    account.charges_enabled ? 1 : 0,
+    account.payouts_enabled ? 1 : 0,
+    timestamp,
+    timestamp,
+  );
+}
+
+async function getOrCreateCreatorStripeAccount(discordUserId) {
+  const existing =
+    statements.getStripeAccountForUser.get(
+      discordUserId,
+    );
+
+  if (existing) {
+    try {
+      const account = await stripe.accounts.retrieve(
+        existing.stripe_account_id,
+      );
+
+      saveStripeAccount(discordUserId, account);
+
+      return account;
+    } catch (error) {
+      if (
+        error?.code !== 'resource_missing'
+      ) {
+        throw error;
+      }
+    }
+  }
+
+  const account = await stripe.accounts.create({
+    type: 'express',
+    metadata: {
+      discord_user_id: discordUserId,
+    },
+  });
+
+  saveStripeAccount(discordUserId, account);
+
+  return account;
+}
+
+async function createCreatorStripeUrl(discordUserId) {
+  const account =
+    await getOrCreateCreatorStripeAccount(
+      discordUserId,
+    );
+
+  if (
+    account.details_submitted &&
+    account.payouts_enabled
+  ) {
+    const loginLink =
+      await stripe.accounts.createLoginLink(
+        account.id,
+      );
+
+    return {
+      url: loginLink.url,
+      connected: true,
+    };
+  }
+
+  const accountLink =
+    await stripe.accountLinks.create({
+      account: account.id,
+      refresh_url:
+  'https://partnerlinks.app/stripe/connect/refresh',
+return_url:
+  'https://partnerlinks.app/stripe/connect/return',
+      type: 'account_onboarding',
+    });
+
+  return {
+    url: accountLink.url,
+    connected: false,
+  };
+}
+
+/*
+|--------------------------------------------------------------------------
 | Referral panel
 |--------------------------------------------------------------------------
 */
@@ -446,31 +579,34 @@ function createReferralPanel() {
     .setTitle('UGC NETWORK')
     .setDescription(
       [
-        '**Invite To Earn**',
+        '**Referral Program**',
+        '',
+        'Invite brands to UGC NETWORK **Discord** using your unique link. If a brand signs up for a paid affiliate or management plan, you earn **33% of their monthly plan recurring revenue** for as long as we work with that brand.',
         '',
         '**How it works**',
-        '1. Click **Create Invite**',
-        '2. Share it with creators.',
-        '3. Win prizes and exclusive deals.',
+        '1. Click **Create Link**',
+        '2. Share your link with brands',
+        '3. Earn **33% recurring revenue** on every brand that signs up',
+        '',
+        '```ansi',
+        '\u001b[32mOnce a brand joins through your link, the referral is yours forever. If they ever become a client, you’ll automatically be added to their payment schedule. Check referrals and subscription status in My Referrals.\u001b[0m',
+        '```',
       ].join('\n'),
-    )
-    ;
+    );
 
   const actionRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId('referral:create')
-      .setLabel('Create Invite')
-      .setStyle(ButtonStyle.Primary),
-
+      .setLabel('🔗 Create Link')
+      .setStyle(ButtonStyle.Success),
     new ButtonBuilder()
       .setCustomId('referral:stats')
-      .setLabel('My Referrals')
+      .setLabel('💰 My Referrals')
       .setStyle(ButtonStyle.Secondary),
-
     new ButtonBuilder()
-      .setCustomId('referral:leaderboard')
-      .setLabel('Leaderboard')
-      .setStyle(ButtonStyle.Secondary),
+      .setCustomId('referral:stripe')
+      .setLabel('▰ Stripe')
+      .setStyle(ButtonStyle.Primary),
   );
 
   return {
@@ -1128,6 +1264,42 @@ client.on(
                         `Did not qualify: **${statistics.left}**`,
             `Total points: **${statistics.points}**`,
           ].join('\n'),
+        );
+
+        return;
+      }
+
+      /*
+      |--------------------------------------------------------------------------
+      | Stripe Connect
+      |--------------------------------------------------------------------------
+      */
+
+      if (
+        interaction.customId ===
+        'referral:stripe'
+      ) {
+        const stripeResult =
+          await createCreatorStripeUrl(
+            interaction.user.id,
+          );
+
+        await interaction.editReply(
+          stripeResult.connected
+            ? [
+                '**Stripe connected**',
+                '',
+                'Your Stripe account is ready for payouts.',
+                '',
+                stripeResult.url,
+              ].join('\n')
+            : [
+                '**Set up Stripe**',
+                '',
+                'Complete Stripe setup so PartnerLinks can send your referral payouts.',
+                '',
+                stripeResult.url,
+              ].join('\n'),
         );
 
         return;
