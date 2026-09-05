@@ -3,6 +3,7 @@
 require('dotenv').config();
 
 const fs = require('node:fs');
+const http = require('node:http');
 const path = require('node:path');
 const Database = require('better-sqlite3');
 const Stripe = require('stripe');
@@ -71,6 +72,10 @@ const config = {
     process.env.REFERRAL_ENTRY_CHANNEL_ID.trim(),
   stripeSecretKey:
     process.env.STRIPE_SECRET_KEY.trim(),
+  stripeHttpPort: readNonNegativeInteger(
+    'REFERRAL_HTTP_PORT',
+    3002,
+  ),
 
   verifiedRoleId:
     process.env.REFERRAL_VERIFIED_ROLE_ID?.trim() || null,
@@ -550,6 +555,156 @@ async function createCreatorStripeUrl(discordUserId) {
       account.payouts_enabled,
   };
 }
+
+/*
+|--------------------------------------------------------------------------
+| Stripe Connect HTTP redirect
+|--------------------------------------------------------------------------
+*/
+
+const stripeHttpServer = http.createServer(
+  async (request, response) => {
+    try {
+      const url = new URL(
+        request.url,
+        'http://127.0.0.1',
+      );
+
+      if (
+        request.method === 'GET' &&
+        url.pathname === '/stripe/connect/start'
+      ) {
+        const accountId =
+          url.searchParams.get('account');
+
+        if (
+          !accountId ||
+          !accountId.startsWith('acct_')
+        ) {
+          response.writeHead(400, {
+            'Content-Type':
+              'text/plain; charset=utf-8',
+          });
+
+          response.end(
+            'Invalid Stripe account.',
+          );
+
+          return;
+        }
+
+        const account =
+          await stripe.accounts.retrieve(
+            accountId,
+          );
+
+        let stripeUrl;
+
+        if (
+          account.details_submitted &&
+          account.payouts_enabled
+        ) {
+          const loginLink =
+            await stripe.accounts.createLoginLink(
+              accountId,
+            );
+
+          stripeUrl = loginLink.url;
+        } else {
+          const baseUrl =
+            'https:' +
+            '//referrals.partnerlinks.app';
+
+          const accountLink =
+            await stripe.accountLinks.create({
+              account: accountId,
+              refresh_url:
+                baseUrl +
+                '/stripe/connect/refresh',
+              return_url:
+                baseUrl +
+                '/stripe/connect/return',
+              type: 'account_onboarding',
+            });
+
+          stripeUrl = accountLink.url;
+        }
+
+        response.writeHead(302, {
+          Location: stripeUrl,
+        });
+
+        response.end();
+        return;
+      }
+
+      if (
+        request.method === 'GET' &&
+        url.pathname === '/stripe/connect/return'
+      ) {
+        response.writeHead(200, {
+          'Content-Type':
+            'text/plain; charset=utf-8',
+        });
+
+        response.end(
+          'Stripe setup complete. You can return to Discord and click Stripe again to view your account.',
+        );
+
+        return;
+      }
+
+      if (
+        request.method === 'GET' &&
+        url.pathname === '/stripe/connect/refresh'
+      ) {
+        response.writeHead(200, {
+          'Content-Type':
+            'text/plain; charset=utf-8',
+        });
+
+        response.end(
+          'Your Stripe setup link expired. Return to Discord and click Stripe again to continue setup.',
+        );
+
+        return;
+      }
+
+      response.writeHead(404, {
+        'Content-Type':
+          'text/plain; charset=utf-8',
+      });
+
+      response.end('Not found.');
+    } catch (error) {
+      logError(
+        'Stripe Connect HTTP server',
+        error,
+      );
+
+      if (!response.headersSent) {
+        response.writeHead(500, {
+          'Content-Type':
+            'text/plain; charset=utf-8',
+        });
+      }
+
+      response.end(
+        'Stripe setup failed.',
+      );
+    }
+  },
+);
+
+stripeHttpServer.on(
+  'error',
+  (error) => {
+    logError(
+      'Stripe HTTP server',
+      error,
+    );
+  },
+);
 
 /*
 |--------------------------------------------------------------------------
@@ -1499,6 +1654,16 @@ process.once('SIGTERM', () => {
 | Login
 |--------------------------------------------------------------------------
 */
+
+stripeHttpServer.listen(
+  config.stripeHttpPort,
+  '127.0.0.1',
+  () => {
+    console.log(
+      `Stripe HTTP server listening on 127.0.0.1:${config.stripeHttpPort}`,
+    );
+  },
+);
 
 client.login(config.token).catch((error) => {
   logError('Discord login', error);
