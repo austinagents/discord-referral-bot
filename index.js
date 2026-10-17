@@ -1292,7 +1292,7 @@ client.on(
       }
 
       const member = interaction.options.getUser('member', true);
-      const brand = interaction.options.getString('brand', true).trim().replace(/\\s+/g, ' ');
+      const brand = interaction.options.getString('brand', true).trim().replace(/\s+/g, ' ');
       const points = interaction.options.getInteger('points') ?? 100;
       const brandKey = brand.toLocaleLowerCase('en-US');
 
