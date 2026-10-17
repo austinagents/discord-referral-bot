@@ -190,6 +190,21 @@ database.exec(`
     user_id
   );
 
+  CREATE TABLE IF NOT EXISTS qualified_brands (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT NOT NULL,
+    brand_key TEXT NOT NULL,
+    brand_name TEXT NOT NULL,
+    referrer_user_id TEXT NOT NULL,
+    points INTEGER NOT NULL CHECK (points >= 0),
+    recorded_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (guild_id, brand_key)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_qualified_brands_referrer
+  ON qualified_brands (guild_id, referrer_user_id);
+
   CREATE TABLE IF NOT EXISTS creator_stripe_accounts (
     discord_user_id TEXT PRIMARY KEY,
     stripe_account_id TEXT UNIQUE NOT NULL,
@@ -366,6 +381,22 @@ const statements = {
       AND inviter_user_id = ?
   `),
 
+  addQualifiedBrand: database.prepare(`
+    INSERT INTO qualified_brands
+      (guild_id, brand_key, brand_name, referrer_user_id, points, recorded_by, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `),
+  getBrandStatistics: database.prepare(`
+    SELECT COUNT(*) AS brand_count, COALESCE(SUM(points), 0) AS brand_points
+    FROM qualified_brands
+    WHERE guild_id = ? AND referrer_user_id = ?
+  `),
+  getBrandsForUser: database.prepare(`
+    SELECT brand_name, points FROM qualified_brands
+    WHERE guild_id = ? AND referrer_user_id = ?
+    ORDER BY created_at DESC, id DESC
+    LIMIT 20
+  `),
   getPointTotal: database.prepare(`
     SELECT
       COALESCE(SUM(points), 0) AS total
@@ -471,12 +502,14 @@ function getUserStatistics(guildId, userId) {
     guildId,
     userId,
   );
+  const brands = statements.getBrandStatistics.get(guildId, userId);
 
   return {
     qualified: Number(counts?.qualified || 0),
     pending: Number(counts?.pending || 0),
     left: Number(counts?.left_count || 0),
-    points: Number(points?.total || 0),
+    brands: Number(brands?.brand_count || 0),
+    points: Number(points?.total || 0) + Number(brands?.brand_points || 0),
   };
 }
 
@@ -1114,6 +1147,19 @@ async function registerCommands() {
       PermissionFlagsBits.Administrator,
     );
 
+  const qualifyBrandCommand = new SlashCommandBuilder()
+    .setName('qualify-brand')
+    .setDescription('Admin: record a qualified brand and award referral points.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addUserOption(option => option.setName('member')
+      .setDescription('Member who referred the brand').setRequired(true))
+    .addStringOption(option => option.setName('brand')
+      .setDescription('Name of the qualified brand').setRequired(true)
+      .setMinLength(1).setMaxLength(100))
+    .addIntegerOption(option => option.setName('points')
+      .setDescription('Points to award (default: 100)').setMinValue(0)
+      .setMaxValue(1000000));
+
   const rest = new REST({
     version: '10',
   }).setToken(config.token);
@@ -1124,7 +1170,7 @@ async function registerCommands() {
       config.guildId,
     ),
     {
-      body: [setupCommand.toJSON()],
+      body: [setupCommand.toJSON(), qualifyBrandCommand.toJSON()],
     },
   );
 
@@ -1235,6 +1281,46 @@ client.on(
     }
 
     if (interaction.guildId !== config.guildId) {
+      return;
+    }
+
+    if (interaction.isChatInputCommand() &&
+        interaction.commandName === 'qualify-brand') {
+      if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+        await interaction.reply({ content: 'Administrator permission required.', ephemeral: true });
+        return;
+      }
+
+      const member = interaction.options.getUser('member', true);
+      const brand = interaction.options.getString('brand', true).trim().replace(/\\s+/g, ' ');
+      const points = interaction.options.getInteger('points') ?? 100;
+      const brandKey = brand.toLocaleLowerCase('en-US');
+
+      if (!brand) {
+        await interaction.reply({ content: 'Brand name cannot be empty.', ephemeral: true });
+        return;
+      }
+
+      try {
+        statements.addQualifiedBrand.run(
+          interaction.guildId, brandKey, brand, member.id,
+          points, interaction.user.id, nowIso()
+        );
+        await interaction.reply({
+          content: `Recorded **${brand}** for <@${member.id}>: **${points} points**. Their My Referrals statistics now include this brand.`,
+          ephemeral: true,
+        });
+      } catch (error) {
+        if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+          await interaction.reply({
+            content: 'That brand is already recorded in this server. No additional points were awarded.',
+            ephemeral: true,
+          });
+        } else {
+          logError('/qualify-brand', error);
+          await interaction.reply({ content: 'Could not record the brand. No success was confirmed.', ephemeral: true });
+        }
+      }
       return;
     }
 
@@ -1399,8 +1485,11 @@ client.on(
             '**Your referral statistics**',
             '',
             `Invites: **${statistics.qualified}**`,
-                        `Qualified Brands: **${statistics.left}**`,
+            `Qualified Brands: **${statistics.brands}**`,
             `Total points: **${statistics.points}**`,
+            '',
+            ...statements.getBrandsForUser.all(interaction.guildId, interaction.user.id)
+              .map(row => `• ${row.brand_name}: ${row.points} points`),
           ].join('\n'),
         );
 
