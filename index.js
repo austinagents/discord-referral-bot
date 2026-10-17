@@ -1399,7 +1399,7 @@ client.on(
             '**Your referral statistics**',
             '',
             `Invites: **${statistics.qualified}**`,
-                        `Did not qualify: **${statistics.left}**`,
+                        `Qualified Brands: **${statistics.left}**`,
             `Total points: **${statistics.points}**`,
           ].join('\n'),
         );
